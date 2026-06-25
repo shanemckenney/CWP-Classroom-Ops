@@ -1,0 +1,38 @@
+{
+  "rules": {
+    "control": {
+      ".read":  true,
+      ".write": false
+    },
+    "questionBank": {
+      ".read":  true,
+      ".write": false
+    },
+    "players": {
+      ".read": true,
+      "$callsign": {
+        ".validate": "newData.child('callsign').val().matches(/^[A-Z0-9_\\-]{2,20}$/)",
+        ".write": "!data.exists() || (data.child('submitted').val() !== true)",
+        "score": {
+          ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 1500"
+        },
+        "submitted": {
+          ".validate": "newData.isBoolean()"
+        },
+        "callsign": {
+          ".validate": "newData.isString() && newData.val().matches(/^[A-Z0-9_\\-]{2,20}$/)"
+        },
+        "joinedAt":  { ".validate": "newData.isNumber()" },
+        "updatedAt": { ".validate": "newData.isNumber()" },
+        "answers": {
+          "$qIndex": {
+            "selected":   { ".validate": "newData.isNumber() && newData.val() >= -1 && newData.val() <= 3" },
+            "correct":    { ".validate": "newData.isBoolean()" },
+            "points":     { ".validate": "newData.isNumber() && newData.val() >= 0 && newData.val() <= 150" },
+            "reflection": { ".validate": "newData.isString() && newData.val().length <= 2000" }
+          }
+        }
+      }
+    }
+  }
+}

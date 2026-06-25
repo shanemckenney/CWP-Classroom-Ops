@@ -1,0 +1,1359 @@
+<!DOCTYPE html>
+<!--
+  ================================================================
+  CWP CLASSROOM OPS  //  MYCOMPUTERCAREER
+  Version 3.0 — Firebase Question Bank Edition
+  ================================================================
+  WHAT CHANGED IN v3
+  ------------------
+  Question bank is now stored in Firebase, not in this file.
+  Paste tonight's JSON into the dashboard → click Apply → done.
+  No GitHub push required for question changes.
+
+  THE ONLY THINGS YOU EVER EDIT IN THIS FILE:
+  1. FIREBASE_CONFIG  — one time during setup
+  2. INSTRUCTOR_PIN   — once per cohort
+
+  EVERYTHING ELSE (questions, session name, mode, timer) lives
+  in Firebase and is managed from the instructor dashboard.
+
+  SSDLC CONTROLS
+  --------------
+  [SEC-01] PIN — plaintext, module-scoped. Deterrent control.
+  [SEC-02] Zero innerHTML on untrusted data (XSS prevention)
+  [SEC-03] Content Security Policy meta tag
+  [SEC-04] No globals — ES module scope only
+  [SEC-05] Callsign validated client + server (Firebase Rules)
+  [SEC-06] Score capped client + server
+  [SEC-07] Submit lock via Firebase Rules
+  [SEC-08] Firebase config isolated in module scope
+  [SEC-09] Question bank validated before Firebase write
+  ================================================================
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CWP // CLASSROOM OPS</title>
+
+<!-- [SEC-03] Content Security Policy -->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'self' 'unsafe-inline' https://www.gstatic.com;
+  style-src 'unsafe-inline';
+  connect-src https://*.firebaseio.com https://*.googleapis.com wss://*.firebaseio.com;
+  font-src 'none'; img-src 'none'; object-src 'none';
+  base-uri 'none'; form-action 'none';
+">
+
+<script type="module">
+  import { initializeApp }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, set, get, onValue, update, remove }
+    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+  // ================================================================
+  //  FIREBASE CONFIG — fill this in once during setup
+  //  This is a public client config, not a secret key.
+  //  Security is enforced by Firebase Rules, not by hiding this.
+  // ================================================================
+  const FIREBASE_CONFIG = {
+    apiKey:            "YOUR_API_KEY",
+    authDomain:        "YOUR_PROJECT.firebaseapp.com",
+    databaseURL:       "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+    projectId:         "YOUR_PROJECT",
+    storageBucket:     "YOUR_PROJECT.appspot.com",
+    messagingSenderId: "YOUR_SENDER_ID",
+    appId:             "YOUR_APP_ID"
+  };
+
+  // ================================================================
+  //  [SEC-01] INSTRUCTOR PIN — change this string, push once.
+  //  Rotate each cohort. One line. That's it.
+  // ================================================================
+  const INSTRUCTOR_PIN = "CWP2025";
+
+  // ================================================================
+  //  QUESTION BANK TEMPLATE — copy this into your .json files
+  //  You paste this nightly into the dashboard — NOT into this file.
+  //
+  //  {
+  //    "session":      "A+ 1201 — Day 1",
+  //    "ticketMode":   "opening",
+  //    "timerSeconds": 30,
+  //    "questions": [
+  //      {
+  //        "type":    "mc",
+  //        "prompt":  "Question text here?",
+  //        "options": ["A", "B", "C", "D"],
+  //        "answer":  0
+  //      },
+  //      {
+  //        "type":    "scenario",
+  //        "prompt":  "A user reports that... What do you do first?",
+  //        "options": ["A", "B", "C", "D"],
+  //        "answer":  2
+  //      },
+  //      {
+  //        "type":   "reflection",
+  //        "prompt": "In your own words, explain..."
+  //      }
+  //    ]
+  //  }
+  // ================================================================
+
+  // ── [SEC-02] SAFE DOM HELPERS ────────────────────────────────
+  const safeText = (el, text) => { el.textContent = String(text); };
+  function safeMake(tag, cls, text) {
+    const el = document.createElement(tag);
+    if (cls)  el.className = cls;
+    if (text !== undefined) el.textContent = String(text);
+    return el;
+  }
+
+  // ── [SEC-05] CALLSIGN VALIDATION ─────────────────────────────
+  const CALLSIGN_RE = /^[A-Z0-9_\-]{2,20}$/;
+  function sanitizeCallsign(raw) {
+    const clean = raw.toUpperCase().trim().replace(/[^A-Z0-9_\-]/g, "").slice(0, 20);
+    return CALLSIGN_RE.test(clean) ? clean : null;
+  }
+
+  // ── [SEC-09] QUESTION BANK VALIDATOR ─────────────────────────
+  // Runs before any Firebase write. Returns { ok, errors[] }.
+  function validateBank(bank) {
+    const errors = [];
+    if (!bank || typeof bank !== "object") {
+      return { ok: false, errors: ["Root must be a JSON object"] };
+    }
+    if (!bank.session || typeof bank.session !== "string" || !bank.session.trim()) {
+      errors.push("'session' is required and must be a non-empty string");
+    }
+    if (!["opening", "exit"].includes(bank.ticketMode)) {
+      errors.push("'ticketMode' must be \"opening\" or \"exit\"");
+    }
+    if (typeof bank.timerSeconds !== "number" || bank.timerSeconds < 5 || bank.timerSeconds > 120) {
+      errors.push("'timerSeconds' must be a number between 5 and 120");
+    }
+    if (!Array.isArray(bank.questions) || bank.questions.length === 0) {
+      errors.push("'questions' must be a non-empty array");
+    } else if (bank.questions.length > 10) {
+      errors.push("Maximum 10 questions per bank");
+    } else {
+      bank.questions.forEach((q, i) => {
+        const n = `Question ${i + 1}`;
+        if (!["mc", "scenario", "reflection"].includes(q.type)) {
+          errors.push(`${n}: 'type' must be "mc", "scenario", or "reflection"`);
+        }
+        if (!q.prompt || typeof q.prompt !== "string" || !q.prompt.trim()) {
+          errors.push(`${n}: 'prompt' is required`);
+        }
+        if (q.type === "mc" || q.type === "scenario") {
+          if (!Array.isArray(q.options) || q.options.length < 2 || q.options.length > 4) {
+            errors.push(`${n}: 'options' must be an array of 2–4 strings`);
+          } else if (q.options.some(o => typeof o !== "string" || !o.trim())) {
+            errors.push(`${n}: all options must be non-empty strings`);
+          }
+          if (typeof q.answer !== "number" || q.answer < 0 || q.answer >= (q.options?.length || 0)) {
+            errors.push(`${n}: 'answer' must be a valid 0-based index into options`);
+          }
+        }
+      });
+    }
+    return { ok: errors.length === 0, errors };
+  }
+
+  // ── FIREBASE INIT [SEC-04] ────────────────────────────────────
+  const app       = initializeApp(FIREBASE_CONFIG);
+  const db        = getDatabase(app);
+  const rPlayers  = ref(db, "players");
+  const rControl  = ref(db, "control");
+  const rBank     = ref(db, "questionBank");
+
+  // ── CONSTANTS ────────────────────────────────────────────────
+  const KEYS = ["A", "B", "C", "D"];
+  const COMPLETE_MSGS = [
+    "Data packet delivered. Stand by for instructor review.",
+    "Uplink confirmed. Your response is locked in.",
+    "Transmission received. Good work, operator.",
+    "Sitrep logged. Session debrief incoming.",
+    "Packet integrity verified. Scores synced."
+  ];
+
+  // ── APP STATE ─────────────────────────────────────────────────
+  let callsign    = "";
+  let currentQ    = 0;
+  let score       = 0;
+  let answered    = [];
+  let timerInt    = null;
+  let timeLeft    = 0;
+  let lbCache     = [];
+  let missionUp   = false;
+  let dashInit    = false;
+  let activeBank  = null;   // loaded from Firebase at runtime
+  let maxScore    = 0;
+
+  // ── SCREEN ROUTER ─────────────────────────────────────────────
+  const allScreens = [...document.querySelectorAll(".screen")];
+  function show(id) {
+    allScreens.forEach(s => s.classList.remove("active"));
+    document.getElementById(id).classList.add("active");
+  }
+
+  // ── HELPERS ───────────────────────────────────────────────────
+  function calcMaxScore(bank) {
+    return bank.questions.reduce((s, q) =>
+      s + (q.type === "reflection" ? 50 : 150), 0);
+  }
+
+  function applyBankToUI(bank) {
+    const modeLbl = bank.ticketMode === "exit" ? "EXIT DEBRIEF" : "OPENING BRIEF";
+    document.querySelectorAll(".js-session").forEach(el => safeText(el, bank.session));
+    document.querySelectorAll(".js-mode").forEach(el => safeText(el, modeLbl));
+    document.querySelectorAll(".js-mode-chip").forEach(el => {
+      safeText(el, modeLbl);
+      el.classList.toggle("exit", bank.ticketMode === "exit");
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  SPLASH SCREEN
+  // ═══════════════════════════════════════════════════════════════
+
+  document.getElementById("splash-student-btn").addEventListener("click", () => {
+    show("screen-callsign");
+  });
+
+  document.getElementById("splash-instructor-btn").addEventListener("click", () => {
+    show("screen-pin");
+    document.getElementById("pin-input").focus();
+  });
+
+  // ── PIN SCREEN ────────────────────────────────────────────────
+  document.getElementById("pin-submit").addEventListener("click", checkPin);
+  document.getElementById("pin-input").addEventListener("keydown", e => {
+    if (e.key === "Enter") checkPin();
+  });
+  document.getElementById("pin-back").addEventListener("click", () => {
+    document.getElementById("pin-input").value = "";
+    safeText(document.getElementById("pin-err"), "");
+    show("screen-splash");
+  });
+
+  function checkPin() {
+    const val = document.getElementById("pin-input").value;
+    if (val === INSTRUCTOR_PIN) {
+      document.getElementById("pin-input").value = "";
+      safeText(document.getElementById("pin-err"), "");
+      show("screen-dash");
+      startDash();
+    } else {
+      safeText(document.getElementById("pin-err"), "ACCESS DENIED");
+      document.getElementById("pin-input").value = "";
+      document.getElementById("pin-input").focus();
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  STUDENT FLOW
+  // ═══════════════════════════════════════════════════════════════
+
+  document.getElementById("cs-submit").addEventListener("click", doCallsign);
+  document.getElementById("cs-input").addEventListener("keydown", e => {
+    if (e.key === "Enter") doCallsign();
+  });
+
+  async function doCallsign() {
+    const raw   = document.getElementById("cs-input").value;
+    const clean = sanitizeCallsign(raw);
+    if (!clean) {
+      safeText(document.getElementById("cs-err"),
+        "2–20 characters. Letters, numbers, _ and - only.");
+      return;
+    }
+    safeText(document.getElementById("cs-err"), "");
+    callsign = clean;
+
+    // Load question bank from Firebase first
+    let bank;
+    try {
+      const snap = await get(rBank);
+      if (!snap.exists()) {
+        safeText(document.getElementById("cs-err"),
+          "No question bank loaded yet. Ask your instructor to load tonight's questions.");
+        return;
+      }
+      bank = snap.val();
+      const v = validateBank(bank);
+      if (!v.ok) {
+        safeText(document.getElementById("cs-err"),
+          "Question bank has errors. Notify your instructor.");
+        return;
+      }
+    } catch (_) {
+      safeText(document.getElementById("cs-err"),
+        "Cannot reach database. Check your connection.");
+      return;
+    }
+
+    activeBank = bank;
+    maxScore   = calcMaxScore(bank);
+    applyBankToUI(bank);
+
+    // Check if already submitted
+    try {
+      const snap = await get(ref(db, `players/${callsign}`));
+      if (snap.exists() && snap.val().submitted) {
+        score = snap.val().score || 0;
+        show("screen-complete");
+        safeText(document.getElementById("cmp-pts"), score);
+        safeText(document.getElementById("cmp-msg"),
+          COMPLETE_MSGS[Math.floor(Math.random() * COMPLETE_MSGS.length)]);
+        watchLeaderboard(() => renderLbMini());
+        return;
+      }
+    } catch (_) {}
+
+    await set(ref(db, `players/${callsign}`), {
+      callsign, score: 0, submitted: false,
+      joinedAt: Date.now(), answers: {}
+    });
+
+    safeText(document.getElementById("sb-callsign"), callsign);
+    show("screen-standby");
+    waitForLaunch();
+  }
+
+  // ── STANDBY ───────────────────────────────────────────────────
+  function waitForLaunch() {
+    onValue(rControl, snap => {
+      const ctrl = snap.val() || {};
+      if (ctrl.live && !missionUp) {
+        missionUp = true;
+        beginMission();
+      }
+    });
+    watchLeaderboard(() => {
+      const r  = myRank();
+      const el = document.getElementById("sb-rank");
+      if (r) { safeText(el, `RANK #${r}`); el.classList.remove("hidden"); }
+    });
+  }
+
+  // ── MISSION ───────────────────────────────────────────────────
+  function beginMission() {
+    currentQ = 0; score = 0; answered = [];
+    show("screen-question");
+    loadQ(0);
+  }
+
+  function loadQ(idx) {
+    clearInterval(timerInt);
+    const q    = activeBank.questions[idx];
+    const tot  = activeBank.questions.length;
+    const last = idx === tot - 1;
+
+    safeText(document.getElementById("q-counter"), `QUESTION ${idx + 1} OF ${tot}`);
+
+    const badge = document.getElementById("q-type-badge");
+    badge.className = "q-type-badge" +
+      (q.type === "scenario"   ? " scenario"   : "") +
+      (q.type === "reflection" ? " reflection" : "");
+    safeText(badge,
+      q.type === "mc"       ? "MULTIPLE CHOICE" :
+      q.type === "scenario" ? "FIELD SCENARIO"  : "REFLECTION");
+
+    safeText(document.getElementById("q-prompt"), q.prompt);
+
+    const fb = document.getElementById("feedback-bar");
+    fb.textContent = ""; fb.className = "feedback-bar";
+    document.getElementById("q-next-btn").classList.add("hidden");
+    document.getElementById("q-submit-btn").classList.add("hidden");
+    document.getElementById("options-list").innerHTML = "";
+    document.getElementById("reflection-wrap").classList.add("hidden");
+    document.getElementById("reflection-text").value = "";
+
+    if (q.type === "mc" || q.type === "scenario") {
+      document.querySelector(".timer-track").style.display = "block";
+      renderOptions(q, last);
+      startCountdown(activeBank.timerSeconds || 30, () => timeUp(q, last));
+    } else {
+      document.querySelector(".timer-track").style.display = "none";
+      safeText(document.getElementById("q-timer-label"), "");
+      document.getElementById("q-timer-label").className = "q-timer-label";
+      document.getElementById("timer-fill").style.width = "0%";
+      document.getElementById("reflection-wrap").classList.remove("hidden");
+      (last
+        ? document.getElementById("q-submit-btn")
+        : document.getElementById("q-next-btn")
+      ).classList.remove("hidden");
+    }
+  }
+
+  // [SEC-02] Options built with DOM API only
+  function renderOptions(q, last) {
+    const list = document.getElementById("options-list");
+    list.innerHTML = "";
+    q.options.forEach((optText, i) => {
+      const btn = document.createElement("button");
+      btn.className = "opt"; btn.type = "button";
+      btn.appendChild(safeMake("span", "opt-key", KEYS[i]));
+      btn.appendChild(safeMake("span", null, optText));
+      btn.addEventListener("click", () => pickOption(i, q, last));
+      list.appendChild(btn);
+    });
+  }
+
+  function startCountdown(secs, onDone) {
+    timeLeft = secs;
+    const fill  = document.getElementById("timer-fill");
+    const label = document.getElementById("q-timer-label");
+    fill.style.width = "100%"; fill.className = "timer-fill";
+    label.className  = "q-timer-label";
+    safeText(label, `${timeLeft}s`);
+    timerInt = setInterval(() => {
+      timeLeft--;
+      const pct = (timeLeft / secs) * 100;
+      fill.style.width = pct + "%";
+      safeText(label, `${timeLeft}s`);
+      if (pct < 40) { fill.className = "timer-fill warn"; label.className = "q-timer-label warn"; }
+      if (pct < 15) { fill.className = "timer-fill crit"; label.className = "q-timer-label crit"; }
+      if (timeLeft <= 0) { clearInterval(timerInt); onDone(); }
+    }, 1000);
+  }
+
+  function pickOption(sel, q, last) {
+    clearInterval(timerInt);
+    const btns = document.querySelectorAll(".opt");
+    btns.forEach(b => b.classList.add("disabled"));
+    const correct = sel === q.answer;
+    const speed   = Math.round((timeLeft / (activeBank.timerSeconds || 30)) * 50);
+    const pts     = correct ? 100 + speed : 0;
+    score         = Math.min(score + pts, maxScore);
+    btns[sel].classList.add(correct ? "correct" : "wrong");
+    if (!correct) btns[q.answer].classList.add("reveal-correct");
+    const fb = document.getElementById("feedback-bar");
+    if (correct) {
+      safeText(fb, `CORRECT  //  +${pts} pts (includes speed bonus)`);
+      fb.className = "feedback-bar show";
+    } else {
+      fb.textContent = ""; fb.className = "feedback-bar wrong show";
+      fb.appendChild(document.createTextNode(`INCORRECT  //  Correct: ${KEYS[q.answer]}. `));
+      fb.appendChild(document.createTextNode(q.options[q.answer]));
+    }
+    floatScore(correct ? `+${pts}` : "✗", correct);
+    answered[currentQ] = { selected: sel, correct, points: pts };
+    pushPartial();
+    (last
+      ? document.getElementById("q-submit-btn")
+      : document.getElementById("q-next-btn")
+    ).classList.remove("hidden");
+  }
+
+  function timeUp(q, last) {
+    clearInterval(timerInt);
+    const btns = document.querySelectorAll(".opt");
+    btns.forEach(b => b.classList.add("disabled"));
+    if (btns[q.answer]) btns[q.answer].classList.add("reveal-correct");
+    const fb = document.getElementById("feedback-bar");
+    fb.textContent = ""; fb.className = "feedback-bar wrong show";
+    fb.appendChild(document.createTextNode(`TIME EXPIRED  //  Correct: ${KEYS[q.answer]}. `));
+    fb.appendChild(document.createTextNode(q.options[q.answer]));
+    answered[currentQ] = { selected: -1, correct: false, points: 0 };
+    pushPartial();
+    (last
+      ? document.getElementById("q-submit-btn")
+      : document.getElementById("q-next-btn")
+    ).classList.remove("hidden");
+  }
+
+  document.getElementById("q-next-btn").addEventListener("click", () => {
+    saveReflection(); loadQ(++currentQ);
+  });
+  document.getElementById("q-submit-btn").addEventListener("click", () => {
+    clearInterval(timerInt);
+    saveReflection();
+    pushPartial(true);
+    show("screen-complete");
+    safeText(document.getElementById("cmp-pts"), score);
+    safeText(document.getElementById("cmp-msg"),
+      COMPLETE_MSGS[Math.floor(Math.random() * COMPLETE_MSGS.length)]);
+    watchLeaderboard(() => renderLbMini());
+  });
+
+  function saveReflection() {
+    const q = activeBank.questions[currentQ];
+    if (q.type !== "reflection") return;
+    const txt = document.getElementById("reflection-text").value.trim().slice(0, 2000);
+    const pts = txt.length > 5 ? 50 : 0;
+    score = Math.min(score + pts, maxScore);
+    answered[currentQ] = { reflection: txt, points: pts };
+  }
+
+  function pushPartial(submitted = false) {
+    const map = {};
+    answered.forEach((a, i) => { if (a) map[i] = a; });
+    update(ref(db, `players/${callsign}`), {
+      score: Math.min(score, maxScore),
+      submitted, answers: map, updatedAt: Date.now()
+    });
+  }
+
+  function floatScore(text, good) {
+    const el = document.getElementById("score-float");
+    safeText(el, text);
+    el.style.color = good ? "var(--cyan)" : "var(--magenta)";
+    el.classList.remove("pop");
+    void el.offsetWidth;
+    el.classList.add("pop");
+  }
+
+  // ── LEADERBOARD ───────────────────────────────────────────────
+  function watchLeaderboard(onChange) {
+    onValue(rPlayers, snap => {
+      lbCache = Object.values(snap.val() || {})
+        .filter(p => p.submitted)
+        .sort((a, b) => b.score - a.score);
+      onChange();
+    });
+  }
+
+  function myRank() {
+    const i = lbCache.findIndex(p => p.callsign === callsign);
+    return i >= 0 ? i + 1 : null;
+  }
+
+  function renderLbMini() {
+    const rank  = myRank();
+    const total = lbCache.length;
+    safeText(document.getElementById("cmp-rank"),
+      rank ? `RANK #${rank} OF ${total}` : "RANK PENDING...");
+    const wrap = document.getElementById("lb-wrap");
+    wrap.innerHTML = "";
+    lbCache.slice(0, 10).forEach((p, i) => {
+      const isMe = p.callsign === callsign;
+      const row  = safeMake("div", "lb-row" + (isMe ? " is-me" : ""));
+      const name = safeMake("div", "lb-name" + (isMe ? " me" : ""), p.callsign);
+      if (isMe) name.appendChild(safeMake("span", "lb-you-tag", " ◀ YOU"));
+      row.appendChild(safeMake("div", "lb-pos",   `#${i + 1}`));
+      row.appendChild(name);
+      row.appendChild(safeMake("div", "lb-score", p.score));
+      wrap.appendChild(row);
+    });
+    if (rank && rank > 10) {
+      const me  = lbCache[rank - 1];
+      const row = safeMake("div", "lb-row is-me");
+      const nm  = safeMake("div", "lb-name me", me.callsign);
+      nm.appendChild(safeMake("span", "lb-you-tag", " ◀ YOU"));
+      row.appendChild(safeMake("div", "lb-pos",   `#${rank}`));
+      row.appendChild(nm);
+      row.appendChild(safeMake("div", "lb-score", me.score));
+      wrap.appendChild(row);
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  //  INSTRUCTOR DASHBOARD
+  // ═══════════════════════════════════════════════════════════════
+
+  function startDash() {
+    if (dashInit) return;
+    dashInit = true;
+    loadBankPreview();
+    startLiveStats();
+  }
+
+  // ── QUESTION BANK PANEL ───────────────────────────────────────
+
+  // Toggle the paste panel open/closed
+  document.getElementById("qb-toggle").addEventListener("click", () => {
+    const panel = document.getElementById("qb-panel");
+    const isOpen = !panel.classList.contains("hidden");
+    panel.classList.toggle("hidden", isOpen);
+    safeText(document.getElementById("qb-toggle"),
+      isOpen ? "▸ LOAD QUESTION BANK" : "▾ LOAD QUESTION BANK");
+  });
+
+  // Load and display whatever is currently in Firebase
+  async function loadBankPreview() {
+    const previewWrap = document.getElementById("qb-current-preview");
+    try {
+      const snap = await get(rBank);
+      if (!snap.exists()) {
+        renderBankPreview(null);
+        return;
+      }
+      const bank = snap.val();
+      renderBankPreview(bank);
+      // Also pre-populate the textarea for easy editing
+      document.getElementById("qb-paste-area").value =
+        JSON.stringify(bank, null, 2);
+    } catch (e) {
+      safeText(previewWrap, "Could not load current bank from Firebase.");
+    }
+  }
+
+  // [SEC-02] Preview built with DOM API — no innerHTML on bank data
+  function renderBankPreview(bank) {
+    const wrap = document.getElementById("qb-current-preview");
+    wrap.innerHTML = "";
+
+    if (!bank) {
+      const msg = safeMake("div", "qb-no-bank", "No question bank loaded yet.");
+      wrap.appendChild(msg);
+      return;
+    }
+
+    const hdr = safeMake("div", "qb-preview-hdr");
+    const sessionEl = safeMake("span", "qb-preview-session", bank.session);
+    const modeEl    = safeMake("span",
+      "qb-preview-mode " + (bank.ticketMode === "exit" ? "exit" : ""),
+      bank.ticketMode === "exit" ? "EXIT DEBRIEF" : "OPENING BRIEF");
+    hdr.appendChild(sessionEl);
+    hdr.appendChild(modeEl);
+    wrap.appendChild(hdr);
+
+    const meta = safeMake("div", "qb-preview-meta",
+      `${bank.questions?.length || 0} questions  //  ${bank.timerSeconds}s timer  //  Max score: ${calcMaxScore(bank)} pts`);
+    wrap.appendChild(meta);
+
+    (bank.questions || []).forEach((q, i) => {
+      const row = safeMake("div", "qb-q-row");
+      const num = safeMake("span", "qb-q-num", `Q${i + 1}`);
+      const typ = safeMake("span",
+        "qb-q-type " + (q.type === "scenario" ? "scenario" : q.type === "reflection" ? "reflection" : ""),
+        q.type.toUpperCase());
+      const prm = safeMake("span", "qb-q-prompt", q.prompt);
+      row.appendChild(num);
+      row.appendChild(typ);
+      row.appendChild(prm);
+      wrap.appendChild(row);
+    });
+  }
+
+  // Validate button
+  document.getElementById("qb-validate-btn").addEventListener("click", () => {
+    const raw    = document.getElementById("qb-paste-area").value.trim();
+    const status = document.getElementById("qb-status");
+
+    if (!raw) {
+      setQbStatus("Paste your question bank JSON first.", "warn");
+      return;
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      setQbStatus(`JSON syntax error: ${e.message}`, "error");
+      return;
+    }
+
+    const { ok, errors } = validateBank(parsed);
+    if (ok) {
+      setQbStatus("✓ Validation passed. Ready to apply.", "ok");
+      document.getElementById("qb-apply-btn").disabled = false;
+    } else {
+      setQbStatus("Errors found:\n• " + errors.join("\n• "), "error");
+      document.getElementById("qb-apply-btn").disabled = true;
+    }
+  });
+
+  // Apply button — writes to Firebase
+  document.getElementById("qb-apply-btn").addEventListener("click", async () => {
+    const raw = document.getElementById("qb-paste-area").value.trim();
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (_) {
+      setQbStatus("Invalid JSON. Validate first.", "error"); return;
+    }
+    const { ok, errors } = validateBank(parsed);
+    if (!ok) {
+      setQbStatus("Validation failed. Fix errors before applying.", "error");
+      return;
+    }
+
+    document.getElementById("qb-apply-btn").disabled = true;
+    setQbStatus("Writing to Firebase...", "warn");
+
+    try {
+      await set(rBank, parsed);
+      setQbStatus("✓ Question bank applied to Firebase. Students will receive this bank on load.", "ok");
+      renderBankPreview(parsed);
+      // Update dashboard header
+      applyBankToUI(parsed);
+    } catch (e) {
+      setQbStatus(`Firebase write failed: ${e.message}`, "error");
+      document.getElementById("qb-apply-btn").disabled = false;
+    }
+  });
+
+  // Clear button
+  document.getElementById("qb-clear-btn").addEventListener("click", () => {
+    document.getElementById("qb-paste-area").value = "";
+    setQbStatus("", "");
+    document.getElementById("qb-apply-btn").disabled = true;
+  });
+
+  function setQbStatus(msg, type) {
+    const el = document.getElementById("qb-status");
+    safeText(el, msg);
+    el.className = "qb-status" + (type ? " " + type : "");
+  }
+
+  // ── LIVE STATS ────────────────────────────────────────────────
+  function startLiveStats() {
+    onValue(rPlayers, snap => {
+      const data      = snap.val() || {};
+      const players   = Object.values(data);
+      const submitted = players.filter(p => p.submitted);
+      const subCount  = submitted.length;
+      const total     = players.length;
+
+      safeText(document.getElementById("dash-sub-count"),   subCount);
+      safeText(document.getElementById("dash-total-count"), total);
+      document.getElementById("dash-gauge").style.width =
+        total > 0 ? Math.round(subCount / total * 100) + "%" : "0%";
+
+      // Accuracy — reads from activeBank if loaded, else from Firebase preview
+      const bank = activeBank || null;
+      const accWrap = document.getElementById("dash-accuracy");
+      accWrap.innerHTML = "";
+
+      // Try to get question count from bank currently in Firebase
+      get(rBank).then(bSnap => {
+        const b = bSnap.exists() ? bSnap.val() : null;
+        if (!b || !b.questions) {
+          const msg = safeMake("div", null, "Load a question bank to see accuracy.");
+          msg.style.cssText = "font-size:11px;color:var(--text-dim);padding:8px 0";
+          accWrap.appendChild(msg);
+          return;
+        }
+
+        b.questions.forEach((q, qi) => {
+          const row = safeMake("div", "acc-row");
+          if (q.type === "reflection") {
+            const cnt = submitted.filter(p =>
+              p.answers?.[qi]?.reflection?.length > 5).length;
+            const pct = submitted.length > 0
+              ? Math.round(cnt / submitted.length * 100) : 0;
+            const meta = safeMake("div", "acc-meta");
+            const lbl  = safeMake("span", "acc-label", `Q${qi + 1}: REFLECTION`);
+            const pEl  = safeMake("span", "acc-pct", `${pct}% responded`);
+            pEl.style.color = "var(--green-ok)";
+            meta.appendChild(lbl); meta.appendChild(pEl);
+            const track = safeMake("div", "acc-track");
+            const fill  = safeMake("div", "acc-fill");
+            fill.style.cssText = `width:${pct}%;background:var(--green-ok)`;
+            track.appendChild(fill);
+            row.appendChild(meta); row.appendChild(track);
+          } else {
+            const ans  = submitted.filter(p => p.answers?.[qi] != null);
+            const corr = ans.filter(p => p.answers[qi].correct).length;
+            const ap   = ans.length > 0 ? Math.round(corr / ans.length * 100) : 0;
+            const col  = ap >= 70 ? "var(--green-ok)" : ap >= 40 ? "var(--amber)" : "var(--magenta)";
+            const meta = safeMake("div", "acc-meta");
+            const lbl  = safeMake("span", "acc-label",
+              `Q${qi + 1}: ${q.type === "scenario" ? "SCENARIO" : "MC"}`);
+            const pEl  = safeMake("span", "acc-pct", `${ap}% correct`);
+            pEl.style.color = col;
+            meta.appendChild(lbl); meta.appendChild(pEl);
+            const track = safeMake("div", "acc-track");
+            const fill  = safeMake("div", "acc-fill");
+            fill.style.cssText = `width:${ap}%;background:${col}`;
+            track.appendChild(fill);
+            row.appendChild(meta); row.appendChild(track);
+          }
+          accWrap.appendChild(row);
+        });
+      }).catch(() => {});
+
+      // Leaderboard [SEC-02]
+      const lb     = [...submitted].sort((a, b) => b.score - a.score);
+      const lbWrap = document.getElementById("dash-leaderboard");
+      lbWrap.innerHTML = "";
+      if (lb.length === 0) {
+        const empty = safeMake("div", null, "NO SUBMISSIONS YET");
+        empty.style.cssText = "font-size:12px;color:var(--text-dim);padding:12px 0";
+        lbWrap.appendChild(empty);
+      } else {
+        lb.slice(0, 15).forEach((p, i) => {
+          const row = safeMake("div", "dash-lb-row");
+          row.appendChild(safeMake("div", "dash-lb-pos",   `#${i + 1}`));
+          row.appendChild(safeMake("div", "dash-lb-name",  p.callsign));
+          row.appendChild(safeMake("div", "dash-lb-score", `${p.score} pts`));
+          lbWrap.appendChild(row);
+        });
+      }
+    });
+  }
+
+  // ── DASHBOARD CONTROLS ────────────────────────────────────────
+  document.getElementById("dash-launch-btn").addEventListener("click", async () => {
+    // Confirm a bank is loaded before launching
+    const snap = await get(rBank);
+    if (!snap.exists()) {
+      alert("No question bank loaded. Paste and apply a question bank first.");
+      return;
+    }
+    await set(rControl, { live: true, answersRevealed: false, launchedAt: Date.now() });
+    const btn = document.getElementById("dash-launch-btn");
+    safeText(btn, "SESSION ACTIVE ✓");
+    btn.style.cssText += ";border-color:var(--green-ok);color:var(--green-ok)";
+  });
+
+  document.getElementById("dash-reset-btn").addEventListener("click", async () => {
+    if (!confirm("Reset all player data and scores? This cannot be undone.")) return;
+    await remove(rPlayers);
+    await set(rControl, { live: false, answersRevealed: false });
+    const btn = document.getElementById("dash-launch-btn");
+    safeText(btn, "LAUNCH SESSION");
+    btn.style.borderColor = ""; btn.style.color = "";
+  });
+
+  document.getElementById("dash-reveal-btn").addEventListener("click", async () => {
+    await update(rControl, { answersRevealed: true });
+    const btn = document.getElementById("dash-reveal-btn");
+    safeText(btn, "ANSWERS REVEALED ✓");
+    btn.style.cssText += ";border-color:var(--green-ok);color:var(--green-ok)";
+  });
+
+  document.getElementById("dash-exit-btn").addEventListener("click", () => {
+    show("screen-splash");
+  });
+
+</script>
+
+<style>
+:root {
+  --bg:        #050508;
+  --surface:   #090c18;
+  --surface2:  #0d1225;
+  --border:    #1a2040;
+  --border-hi: #1e3060;
+  --cyan:      #00d4ff;
+  --cyan-dim:  #0a4a5a;
+  --cyan-mid:  #0092b3;
+  --cyan-glow: rgba(0,212,255,0.15);
+  --magenta:   #ff2d78;
+  --mag-dim:   rgba(255,45,120,0.12);
+  --amber:     #ffb700;
+  --green-ok:  #00e676;
+  --text:      #c8d8f0;
+  --text-dim:  #3a5080;
+  --text-mid:  #6a88b8;
+  --mono:      'Courier New', Courier, monospace;
+  --r:         2px;
+}
+*, *::before, *::after { box-sizing:border-box; margin:0; padding:0; }
+html { scroll-behavior:smooth; }
+body {
+  background:var(--bg); color:var(--text);
+  font-family:var(--mono); font-size:14px;
+  min-height:100vh; overflow-x:hidden;
+}
+body::after {
+  content:''; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background:
+    radial-gradient(ellipse 60% 40% at 50% 0%,  rgba(0,120,180,0.08) 0%, transparent 70%),
+    radial-gradient(ellipse 40% 30% at 100% 100%,rgba(255,45,120,0.04) 0%, transparent 60%);
+}
+.packet-stream {
+  position:fixed; top:0; left:0; right:0; height:3px;
+  z-index:9000; overflow:hidden; background:var(--bg);
+}
+.packet-stream::before, .packet-stream::after {
+  content:''; position:absolute; top:0; height:100%; width:200px;
+  background:linear-gradient(90deg,transparent,var(--cyan),transparent);
+  animation:packetFlow 3s linear infinite;
+}
+.packet-stream::after {
+  background:linear-gradient(90deg,transparent,var(--magenta),transparent);
+  animation:packetFlow 4.7s linear infinite reverse;
+  animation-delay:-1.4s; width:120px;
+}
+@keyframes packetFlow { 0%{left:-200px} 100%{left:100%} }
+
+.screen { display:none; min-height:100vh; padding:40px 16px 32px; position:relative; z-index:1; }
+.screen.active { display:flex; flex-direction:column; align-items:center; }
+
+/* splash */
+#screen-splash { justify-content:center; }
+.splash-wrap { text-align:center; max-width:520px; width:100%; }
+.splash-logo { font-size:32px; font-weight:bold; color:var(--cyan); letter-spacing:6px; margin-bottom:6px; }
+.splash-logo::after { content:'_'; animation:blink .8s step-end infinite; }
+.splash-sub { font-size:10px; color:var(--text-dim); letter-spacing:4px; margin-bottom:8px; }
+.splash-session { font-size:13px; color:var(--text-mid); letter-spacing:2px; margin-bottom:40px; }
+.splash-divider { font-size:10px; letter-spacing:3px; color:var(--text-dim); margin-bottom:20px; display:flex; align-items:center; gap:12px; }
+.splash-divider::before, .splash-divider::after { content:''; flex:1; height:1px; background:var(--border); }
+.splash-btn-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+.splash-btn { padding:20px 16px; border:1px solid var(--border); background:var(--surface); cursor:pointer; font-family:var(--mono); transition:all .2s; display:flex; flex-direction:column; align-items:center; gap:10px; border-radius:var(--r); }
+.splash-btn:hover { border-color:var(--cyan-mid); background:rgba(0,212,255,0.04); }
+.splash-btn:active { transform:scale(.98); }
+.splash-btn.instructor:hover { border-color:var(--magenta); background:var(--mag-dim); }
+.splash-btn-icon  { font-size:24px; }
+.splash-btn-label { font-size:11px; letter-spacing:3px; color:var(--cyan); text-transform:uppercase; }
+.splash-btn.instructor .splash-btn-label { color:var(--magenta); }
+.splash-btn-desc  { font-size:11px; color:var(--text-dim); line-height:1.5; }
+.splash-footer { margin-top:32px; font-size:10px; color:var(--text-dim); letter-spacing:1px; line-height:1.8; }
+
+/* pin */
+#screen-pin { justify-content:center; }
+.pin-wrap { max-width:380px; width:100%; }
+.pin-card { background:var(--surface); border:1px solid var(--magenta); padding:32px; position:relative; text-align:center; }
+.pin-card::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--magenta),transparent); }
+.pin-title { font-size:12px; letter-spacing:3px; color:var(--magenta); margin-bottom:6px; }
+.pin-sub   { font-size:11px; color:var(--text-dim); margin-bottom:24px; }
+
+/* shared card */
+.card { width:100%; max-width:680px; background:var(--surface); border:1px solid var(--border); padding:28px 28px 24px; margin-bottom:16px; position:relative; }
+.card::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--cyan-mid),transparent); }
+.page-hdr { width:100%; max-width:680px; display:flex; justify-content:space-between; align-items:flex-end; margin-bottom:20px; padding-bottom:12px; border-bottom:1px solid var(--border); }
+.page-hdr-eyebrow { font-size:10px; letter-spacing:3px; color:var(--text-dim); margin-bottom:4px; }
+.page-hdr-title   { font-size:18px; color:var(--cyan); letter-spacing:2px; font-weight:bold; }
+.page-hdr-right   { text-align:right; }
+.mode-chip { font-size:10px; letter-spacing:2px; padding:3px 10px; border:1px solid var(--cyan-mid); color:var(--cyan); display:inline-block; }
+.mode-chip.exit { border-color:var(--magenta); color:var(--magenta); }
+.section-label { font-size:10px; letter-spacing:3px; color:var(--text-dim); margin-bottom:14px; text-transform:uppercase; display:flex; align-items:center; gap:8px; }
+.section-label::after { content:''; flex:1; height:1px; background:var(--border); }
+
+/* buttons */
+.btn { cursor:pointer; font-family:var(--mono); font-size:12px; letter-spacing:2px; text-transform:uppercase; padding:10px 24px; border:1px solid var(--cyan-mid); background:transparent; color:var(--cyan); border-radius:var(--r); transition:all .18s; display:inline-block; }
+.btn:hover { background:var(--cyan-glow); border-color:var(--cyan); color:#fff; box-shadow:0 0 16px rgba(0,212,255,0.2); }
+.btn:active { transform:scale(.97); }
+.btn:disabled { opacity:.4; pointer-events:none; }
+.btn-full    { display:block; width:100%; text-align:center; }
+.btn-magenta { border-color:var(--magenta); color:var(--magenta); }
+.btn-magenta:hover { background:var(--mag-dim); border-color:var(--magenta); color:#fff; box-shadow:0 0 16px rgba(255,45,120,0.2); }
+.btn-amber   { border-color:var(--amber); color:var(--amber); }
+.btn-amber:hover   { background:rgba(255,183,0,0.1); border-color:var(--amber); color:#fff; }
+.btn-ghost   { border-color:var(--border-hi); color:var(--text-mid); }
+.btn-ghost:hover   { background:var(--surface2); border-color:var(--border-hi); color:var(--text); box-shadow:none; }
+.btn-sm { padding:6px 14px; font-size:11px; letter-spacing:1px; }
+
+/* inputs */
+.field-wrap  { margin-bottom:18px; }
+.field-label { display:block; font-size:10px; letter-spacing:2px; color:var(--text-dim); margin-bottom:6px; }
+input[type="text"], input[type="password"], textarea {
+  width:100%; background:var(--bg); border:1px solid var(--border-hi);
+  border-radius:var(--r); color:var(--text); font-family:var(--mono);
+  font-size:14px; padding:10px 14px; outline:none;
+  transition:border-color .2s, box-shadow .2s;
+}
+input[type="text"]:focus, input[type="password"]:focus, textarea:focus {
+  border-color:var(--cyan-mid); box-shadow:0 0 0 2px rgba(0,212,255,0.08);
+}
+textarea { resize:vertical; min-height:110px; line-height:1.6; }
+.err { color:var(--magenta); font-size:11px; margin-top:6px; min-height:16px; letter-spacing:1px; }
+
+/* callsign */
+.cwp-logo-line { font-size:26px; font-weight:bold; color:var(--cyan); letter-spacing:4px; text-align:center; margin-bottom:4px; }
+.cwp-logo-line::after { content:'_'; animation:blink .8s step-end infinite; color:var(--cyan); }
+.cwp-logo-sub  { font-size:10px; color:var(--text-dim); letter-spacing:3px; text-align:center; margin-bottom:32px; }
+
+/* standby */
+#screen-standby { justify-content:center; }
+.standby-center { text-align:center; max-width:480px; }
+.standby-callsign { font-size:24px; color:var(--cyan); letter-spacing:4px; margin-bottom:6px; }
+.standby-status { font-size:11px; color:var(--text-dim); letter-spacing:2px; margin-bottom:32px; }
+.standby-panel { border:1px solid var(--border); padding:20px; font-size:12px; color:var(--text-dim); line-height:2.2; text-align:left; }
+.standby-row { display:flex; gap:12px; }
+.standby-key { color:var(--cyan-mid); min-width:100px; }
+.standby-val { color:var(--text); }
+.rank-pill { display:inline-block; margin-top:14px; padding:4px 16px; border:1px solid var(--border-hi); color:var(--text-mid); font-size:11px; letter-spacing:2px; }
+
+/* question */
+.q-meta { display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; }
+.q-counter { font-size:11px; color:var(--text-dim); letter-spacing:1px; }
+.q-timer-label { font-size:11px; color:var(--text-dim); }
+.q-timer-label.warn { color:var(--amber); }
+.q-timer-label.crit { color:var(--magenta); }
+.timer-track { height:2px; background:var(--border); margin-bottom:20px; }
+.timer-fill  { height:2px; background:var(--cyan); transition:width .25s linear, background .2s; }
+.timer-fill.warn { background:var(--amber); }
+.timer-fill.crit { background:var(--magenta); }
+.q-type-badge { display:inline-block; font-size:9px; letter-spacing:3px; padding:2px 8px; margin-bottom:14px; border:1px solid var(--border-hi); color:var(--text-mid); }
+.q-type-badge.scenario   { border-color:rgba(255,183,0,.4); color:var(--amber); }
+.q-type-badge.reflection { border-color:rgba(0,230,118,.3); color:var(--green-ok); }
+.q-prompt { font-size:15px; color:var(--text); line-height:1.65; margin-bottom:22px; }
+.options-list { display:flex; flex-direction:column; gap:9px; }
+.opt { display:flex; align-items:flex-start; gap:14px; padding:12px 16px; border:1px solid var(--border); background:var(--bg); border-radius:var(--r); cursor:pointer; font-family:var(--mono); font-size:13px; color:var(--text-mid); line-height:1.5; text-align:left; transition:border-color .15s, color .15s, background .15s; width:100%; }
+.opt:hover:not(.disabled) { border-color:var(--cyan-mid); color:var(--text); background:rgba(0,212,255,0.04); }
+.opt.correct      { border-color:var(--green-ok); color:var(--green-ok); background:rgba(0,230,118,0.07); }
+.opt.wrong        { border-color:var(--magenta);  color:var(--magenta);  background:var(--mag-dim); }
+.opt.reveal-correct { border-color:rgba(0,230,118,.4); color:var(--green-ok); background:rgba(0,230,118,0.04); }
+.opt.disabled { pointer-events:none; }
+.opt-key { font-size:11px; color:var(--text-dim); min-width:20px; padding-top:1px; font-weight:bold; }
+.opt.correct .opt-key { color:var(--green-ok); }
+.opt.wrong   .opt-key { color:var(--magenta); }
+.feedback-bar { margin-top:14px; padding:10px 14px; border-left:2px solid var(--cyan); font-size:12px; line-height:1.5; color:var(--cyan); display:none; letter-spacing:.5px; white-space:pre-line; }
+.feedback-bar.show  { display:block; }
+.feedback-bar.wrong { border-color:var(--magenta); color:var(--magenta); }
+.score-float { position:fixed; top:40%; left:50%; transform:translateX(-50%); font-size:40px; font-weight:bold; pointer-events:none; opacity:0; z-index:8000; letter-spacing:2px; }
+.score-float.pop { animation:floatUp 1.1s ease-out forwards; }
+@keyframes floatUp { 0%{opacity:1;transform:translate(-50%,0)} 100%{opacity:0;transform:translate(-50%,-80px)} }
+
+/* complete */
+#screen-complete { justify-content:center; }
+.complete-wrap { text-align:center; max-width:560px; width:100%; }
+.complete-eyebrow  { font-size:10px; letter-spacing:4px; color:var(--text-dim); margin-bottom:10px; }
+.complete-headline { font-size:22px; color:var(--cyan); letter-spacing:3px; margin-bottom:4px; }
+.complete-session  { font-size:11px; color:var(--text-dim); letter-spacing:2px; margin-bottom:28px; }
+.complete-score-block { border:1px solid var(--border); background:var(--surface); padding:24px; margin-bottom:16px; position:relative; }
+.complete-score-block::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,transparent,var(--cyan),transparent); }
+.complete-pts       { font-size:52px; font-weight:bold; color:var(--cyan); line-height:1; }
+.complete-pts-label { font-size:11px; color:var(--text-dim); letter-spacing:3px; margin-top:4px; }
+.complete-rank { font-size:13px; color:var(--text-mid); margin-top:12px; letter-spacing:2px; }
+.complete-msg  { font-size:12px; color:var(--text-dim); margin-top:8px; line-height:1.6; }
+.lb-wrap { margin-top:20px; width:100%; }
+.lb-row { display:flex; align-items:center; gap:10px; padding:8px 14px; border-bottom:1px solid var(--border); font-size:12px; }
+.lb-row.is-me { background:rgba(0,212,255,0.05); border-color:var(--cyan-dim); }
+.lb-pos   { width:28px; color:var(--text-dim); font-size:11px; }
+.lb-name  { flex:1; color:var(--text-mid); }
+.lb-name.me { color:var(--cyan); }
+.lb-score { color:var(--cyan); font-weight:bold; }
+.lb-you-tag { font-size:10px; color:var(--cyan-mid); letter-spacing:1px; margin-left:6px; }
+
+/* ── DASHBOARD ────────────────────────────────────────────────── */
+#screen-dash { padding:20px 16px 32px; align-items:stretch; }
+.dash-inner { width:100%; max-width:940px; margin:0 auto; }
+.dash-hdr { display:flex; justify-content:space-between; align-items:center; border:1px solid var(--border); background:var(--surface); padding:14px 20px; margin-bottom:16px; position:relative; }
+.dash-hdr::before { content:''; position:absolute; top:0; left:0; right:0; height:2px; background:linear-gradient(90deg,var(--magenta),var(--cyan)); }
+.dash-title { font-size:13px; color:var(--cyan); letter-spacing:3px; }
+.dash-sub   { font-size:11px; color:var(--text-dim); margin-top:2px; }
+.dash-grid  { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px; }
+@media(max-width:640px){ .dash-grid{ grid-template-columns:1fr } }
+.dash-card  { background:var(--surface); border:1px solid var(--border); padding:18px; }
+.dash-card-title { font-size:9px; letter-spacing:3px; color:var(--text-dim); padding-bottom:10px; margin-bottom:14px; border-bottom:1px solid var(--border); }
+.dash-card.span2 { grid-column:1/-1; }
+.gauge-count { font-size:38px; font-weight:bold; color:var(--cyan); line-height:1; }
+.gauge-denom { font-size:18px; color:var(--text-dim); }
+.gauge-label { font-size:10px; color:var(--text-dim); letter-spacing:2px; margin:6px 0 10px; }
+.gauge-track { height:6px; background:var(--border); border-radius:1px; overflow:hidden; }
+.gauge-fill  { height:6px; background:var(--cyan); transition:width .5s ease; border-radius:1px; }
+.acc-row  { margin-bottom:14px; }
+.acc-meta { display:flex; justify-content:space-between; align-items:center; font-size:11px; margin-bottom:5px; }
+.acc-label { color:var(--text-dim); }
+.acc-pct   { font-weight:bold; }
+.acc-track { height:5px; background:var(--border); border-radius:1px; overflow:hidden; }
+.acc-fill  { height:5px; border-radius:1px; transition:width .5s ease; }
+.dash-lb-row { display:flex; align-items:center; gap:10px; padding:8px 12px; border-bottom:1px solid var(--border); font-size:12px; }
+.dash-lb-row:first-child { background:rgba(0,212,255,0.05); }
+.dash-lb-pos   { width:28px; color:var(--text-dim); font-size:11px; }
+.dash-lb-name  { flex:1; color:var(--text-mid); }
+.dash-lb-score { color:var(--cyan); font-weight:bold; }
+.dash-controls { display:flex; gap:10px; flex-wrap:wrap; }
+
+/* ── QUESTION BANK PANEL ──────────────────────────────────────── */
+.qb-section { margin-bottom:16px; }
+
+.qb-toggle-bar {
+  width:100%; text-align:left; background:var(--surface);
+  border:1px solid var(--cyan-dim); color:var(--cyan-mid);
+  font-family:var(--mono); font-size:11px; letter-spacing:2px;
+  padding:10px 16px; cursor:pointer;
+  transition:border-color .2s, color .2s;
+}
+.qb-toggle-bar:hover { border-color:var(--cyan-mid); color:var(--cyan); }
+
+.qb-panel {
+  border:1px solid var(--cyan-dim); border-top:none;
+  background:var(--surface2); padding:20px;
+}
+
+.qb-two-col {
+  display:grid; grid-template-columns:1fr 1fr; gap:20px;
+}
+@media(max-width:680px){ .qb-two-col{ grid-template-columns:1fr } }
+
+.qb-col-title {
+  font-size:9px; letter-spacing:3px; color:var(--text-dim);
+  margin-bottom:10px; padding-bottom:8px;
+  border-bottom:1px solid var(--border);
+}
+
+/* paste area */
+#qb-paste-area {
+  font-size:12px; min-height:260px; line-height:1.5;
+  color:var(--cyan); border-color:var(--cyan-dim);
+  background:var(--bg);
+}
+#qb-paste-area:focus { border-color:var(--cyan-mid); }
+
+.qb-btn-row { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+
+/* status bar */
+.qb-status {
+  margin-top:10px; font-size:11px; line-height:1.6;
+  min-height:18px; white-space:pre-line;
+  color:var(--text-dim); letter-spacing:.5px;
+}
+.qb-status.ok    { color:var(--green-ok); }
+.qb-status.warn  { color:var(--amber); }
+.qb-status.error { color:var(--magenta); }
+
+/* preview */
+.qb-no-bank { font-size:12px; color:var(--text-dim); padding:12px 0; }
+
+.qb-preview-hdr {
+  display:flex; justify-content:space-between; align-items:center;
+  margin-bottom:8px;
+}
+.qb-preview-session { font-size:13px; color:var(--text); font-weight:bold; }
+.qb-preview-mode {
+  font-size:10px; letter-spacing:2px; padding:2px 8px;
+  border:1px solid var(--cyan-mid); color:var(--cyan);
+}
+.qb-preview-mode.exit { border-color:var(--magenta); color:var(--magenta); }
+.qb-preview-meta {
+  font-size:11px; color:var(--text-dim); margin-bottom:14px;
+  letter-spacing:.5px;
+}
+.qb-q-row {
+  display:flex; align-items:baseline; gap:8px;
+  padding:8px 0; border-bottom:1px solid var(--border);
+  font-size:12px;
+}
+.qb-q-row:last-child { border-bottom:none; }
+.qb-q-num  { color:var(--text-dim); min-width:24px; font-size:10px; }
+.qb-q-type {
+  font-size:9px; letter-spacing:2px; padding:1px 6px;
+  border:1px solid var(--border-hi); color:var(--text-mid);
+  white-space:nowrap; flex-shrink:0;
+}
+.qb-q-type.scenario   { border-color:rgba(255,183,0,.4); color:var(--amber); }
+.qb-q-type.reflection { border-color:rgba(0,230,118,.3); color:var(--green-ok); }
+.qb-q-prompt { color:var(--text-mid); flex:1; line-height:1.4; }
+
+/* utils */
+.hidden { display:none !important; }
+.mt8  { margin-top:8px; }
+.mt16 { margin-top:16px; }
+.mt24 { margin-top:24px; }
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+.blink { animation:blink 1s step-end infinite; }
+</style>
+</head>
+<body>
+
+<div class="packet-stream"></div>
+
+<!-- SPLASH -->
+<div id="screen-splash" class="screen active">
+  <div class="splash-wrap">
+    <div class="splash-logo">CLASSROOM OPS</div>
+    <div class="splash-sub">MYCOMPUTERCAREER // CYBER WARRIOR PROGRAM</div>
+    <div class="splash-session js-session">LOADING...</div>
+    <div class="splash-divider">SELECT YOUR ROLE</div>
+    <div class="splash-btn-grid">
+      <button class="splash-btn" id="splash-student-btn" type="button">
+        <div class="splash-btn-icon">⬡</div>
+        <div class="splash-btn-label">OPERATOR</div>
+        <div class="splash-btn-desc">Students — click here to join the session</div>
+      </button>
+      <button class="splash-btn instructor" id="splash-instructor-btn" type="button">
+        <div class="splash-btn-icon">◈</div>
+        <div class="splash-btn-label">INSTRUCTOR</div>
+        <div class="splash-btn-desc">Instructors — click here to load questions and launch</div>
+      </button>
+    </div>
+    <div class="splash-footer">
+      Share this URL with students — they click OPERATOR<br>
+      INSTRUCTOR requires an access code
+    </div>
+  </div>
+</div>
+
+<!-- PIN -->
+<div id="screen-pin" class="screen">
+  <div class="pin-wrap">
+    <div class="pin-card">
+      <div class="pin-title">INSTRUCTOR ACCESS</div>
+      <div class="pin-sub">Enter your access code to continue</div>
+      <div class="field-wrap">
+        <label class="field-label" for="pin-input">ACCESS CODE</label>
+        <input type="password" id="pin-input" placeholder="••••••••"
+               autocomplete="off" aria-label="Instructor access code">
+        <div class="err" id="pin-err" role="alert" aria-live="polite"></div>
+      </div>
+      <button class="btn btn-magenta btn-full" id="pin-submit" type="button">AUTHENTICATE →</button>
+      <button class="btn btn-ghost btn-full mt8" id="pin-back" type="button">← BACK</button>
+    </div>
+  </div>
+</div>
+
+<!-- CALLSIGN -->
+<div id="screen-callsign" class="screen">
+  <div style="max-width:680px;width:100%;margin-bottom:20px;">
+    <div class="page-hdr" style="margin-bottom:0">
+      <div class="page-hdr-left">
+        <div class="page-hdr-eyebrow">MYCOMPUTERCAREER // CWP</div>
+        <div class="page-hdr-title">CLASSROOM OPS</div>
+      </div>
+      <div class="page-hdr-right"><div class="mode-chip js-mode-chip"></div></div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="cwp-logo-line">CLASSROOM OPS</div>
+    <div class="cwp-logo-sub js-session"></div>
+    <div class="section-label mt24">OPERATOR IDENTIFICATION</div>
+    <div class="field-wrap">
+      <label class="field-label" for="cs-input">CALLSIGN</label>
+      <input type="text" id="cs-input" placeholder="e.g. NETRUNNER_7"
+             maxlength="20" autocomplete="off" spellcheck="false"
+             aria-label="Enter your callsign">
+      <div class="err" id="cs-err" role="alert" aria-live="polite"></div>
+    </div>
+    <button class="btn btn-full" id="cs-submit" type="button">AUTHENTICATE →</button>
+  </div>
+</div>
+
+<!-- STANDBY -->
+<div id="screen-standby" class="screen">
+  <div class="standby-center">
+    <div class="standby-callsign" id="sb-callsign"></div>
+    <div class="standby-status">AUTHENTICATED <span class="blink">|</span>&nbsp; AWAITING SESSION START</div>
+    <div class="standby-panel">
+      <div class="standby-row"><span class="standby-key">STATUS</span><span class="standby-val">CONNECTED</span></div>
+      <div class="standby-row"><span class="standby-key">SESSION</span><span class="standby-val js-session"></span></div>
+      <div class="standby-row"><span class="standby-key">MODE</span><span class="standby-val js-mode"></span></div>
+      <div class="standby-row"><span class="standby-key">AWAITING</span><span class="standby-val">INSTRUCTOR LAUNCH</span></div>
+    </div>
+    <div class="rank-pill hidden" id="sb-rank"></div>
+  </div>
+</div>
+
+<!-- QUESTION -->
+<div id="screen-question" class="screen">
+  <div style="max-width:680px;width:100%;margin-bottom:16px;" class="page-hdr">
+    <div class="page-hdr-left">
+      <div class="page-hdr-eyebrow">CWP // CLASSROOM OPS</div>
+      <div class="page-hdr-title js-session"></div>
+    </div>
+    <div class="page-hdr-right"><div class="mode-chip js-mode-chip"></div></div>
+  </div>
+  <div class="card">
+    <div class="q-meta">
+      <div class="q-counter" id="q-counter"></div>
+      <div class="q-timer-label" id="q-timer-label"></div>
+    </div>
+    <div class="timer-track"><div class="timer-fill" id="timer-fill" style="width:100%"></div></div>
+    <div class="q-type-badge" id="q-type-badge"></div>
+    <div class="q-prompt" id="q-prompt"></div>
+    <div class="options-list" id="options-list"></div>
+    <div class="hidden" id="reflection-wrap">
+      <textarea id="reflection-text" maxlength="2000"
+        placeholder="Type your response here. Be specific — show what you know."
+        aria-label="Reflection response"></textarea>
+    </div>
+    <div class="feedback-bar" id="feedback-bar" role="status" aria-live="polite"></div>
+    <button class="btn btn-full mt16 hidden" id="q-next-btn"   type="button">NEXT →</button>
+    <button class="btn btn-full mt16 hidden" id="q-submit-btn" type="button">TRANSMIT SITREP →</button>
+  </div>
+</div>
+
+<!-- COMPLETE -->
+<div id="screen-complete" class="screen">
+  <div class="complete-wrap">
+    <div class="complete-eyebrow">CWP // CLASSROOM OPS</div>
+    <div class="complete-headline">SYNC COMPLETE</div>
+    <div class="complete-session js-session"></div>
+    <div class="complete-score-block">
+      <div class="complete-pts" id="cmp-pts">0</div>
+      <div class="complete-pts-label">POINTS LOGGED</div>
+      <div class="complete-rank" id="cmp-rank">RANK: CALCULATING...</div>
+      <div class="complete-msg"  id="cmp-msg"></div>
+    </div>
+    <div class="lb-wrap" id="lb-wrap"></div>
+  </div>
+</div>
+
+<!-- INSTRUCTOR DASHBOARD -->
+<div id="screen-dash" class="screen">
+  <div class="dash-inner">
+
+    <div class="dash-hdr">
+      <div>
+        <div class="dash-title">INSTRUCTOR DASHBOARD</div>
+        <div class="dash-sub js-session">NO BANK LOADED</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:10px;color:var(--text-dim);letter-spacing:1px;margin-bottom:8px"
+             class="js-mode"></div>
+        <button class="btn" id="dash-launch-btn" type="button">LAUNCH SESSION</button>
+      </div>
+    </div>
+
+    <!-- ── QUESTION BANK PANEL ───────────────────────────────── -->
+    <div class="qb-section">
+      <button class="qb-toggle-bar" id="qb-toggle" type="button">
+        ▸ LOAD QUESTION BANK
+      </button>
+      <div class="qb-panel hidden" id="qb-panel">
+        <div class="qb-two-col">
+
+          <!-- LEFT: paste + controls -->
+          <div>
+            <div class="qb-col-title">PASTE QUESTION BANK JSON</div>
+            <textarea id="qb-paste-area"
+              placeholder='Paste your question bank JSON here, then click VALIDATE → APPLY'
+              spellcheck="false" autocomplete="off"
+              aria-label="Question bank JSON input"></textarea>
+            <div class="qb-btn-row">
+              <button class="btn btn-sm" id="qb-validate-btn" type="button">VALIDATE</button>
+              <button class="btn btn-sm btn-amber" id="qb-apply-btn"
+                      type="button" disabled>APPLY TO FIREBASE</button>
+              <button class="btn btn-sm btn-ghost" id="qb-clear-btn" type="button">CLEAR</button>
+            </div>
+            <div class="qb-status" id="qb-status"></div>
+          </div>
+
+          <!-- RIGHT: current bank preview -->
+          <div>
+            <div class="qb-col-title">CURRENT BANK IN FIREBASE</div>
+            <div id="qb-current-preview">
+              <div class="qb-no-bank">Loading...</div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+    </div>
+
+    <!-- ── LIVE STATS GRID ───────────────────────────────────── -->
+    <div class="dash-grid">
+      <div class="dash-card">
+        <div class="dash-card-title">SUBMISSIONS RECEIVED</div>
+        <div class="gauge-count">
+          <span id="dash-sub-count">0</span><span class="gauge-denom"> / <span id="dash-total-count">0</span></span>
+        </div>
+        <div class="gauge-label">OPERATORS SUBMITTED</div>
+        <div class="gauge-track"><div class="gauge-fill" id="dash-gauge" style="width:0%"></div></div>
+      </div>
+      <div class="dash-card">
+        <div class="dash-card-title">ACCURACY BY QUESTION</div>
+        <div id="dash-accuracy">
+          <div style="font-size:11px;color:var(--text-dim);padding:8px 0">
+            Load a question bank to see accuracy data.
+          </div>
+        </div>
+      </div>
+      <div class="dash-card span2">
+        <div class="dash-card-title">LIVE LEADERBOARD</div>
+        <div id="dash-leaderboard">
+          <div style="font-size:12px;color:var(--text-dim);padding:12px 0">NO SUBMISSIONS YET</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="dash-controls">
+      <button class="btn btn-magenta" id="dash-reset-btn"  type="button">RESET SESSION</button>
+      <button class="btn btn-amber"   id="dash-reveal-btn" type="button">REVEAL ANSWERS</button>
+      <button class="btn btn-ghost"   id="dash-exit-btn"   type="button">EXIT DASHBOARD</button>
+    </div>
+
+  </div>
+</div>
+
+<div class="score-float" id="score-float" aria-hidden="true"></div>
+
+</body>
+</html>
