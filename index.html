@@ -21,7 +21,7 @@
   --------------
   [SEC-01] PIN — plaintext, module-scoped. Deterrent control.
   [SEC-02] Zero innerHTML on untrusted data (XSS prevention)
-  [SEC-03] Content Security Policy meta tag
+  [SEC-03] CSP meta tag — REMOVED (see SECURITY.md for rationale)
   [SEC-04] No globals — ES module scope only
   [SEC-05] Callsign validated client + server (Firebase Rules)
   [SEC-06] Score capped client + server
@@ -36,6 +36,16 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CWP // CLASSROOM OPS</title>
 
+<!-- [SEC-03] Content Security Policy -->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'self' 'unsafe-inline' https://www.gstatic.com;
+  style-src 'unsafe-inline';
+  connect-src https://*.firebaseio.com https://*.googleapis.com wss://*.firebaseio.com;
+  font-src 'none'; img-src 'none'; object-src 'none';
+  base-uri 'none'; form-action 'none';
+">
+
 <script type="module">
   import { initializeApp }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
@@ -48,21 +58,20 @@
   //  Security is enforced by Firebase Rules, not by hiding this.
   // ================================================================
   const FIREBASE_CONFIG = {
-      apiKey: "AIzaSyC_ihvtALN-qvGiplWFz0zL-qPwneyr5fw",
-      authDomain: "classroom-ops.firebaseapp.com",
-      databaseURL: "https://classroom-ops-default-rtdb.firebaseio.com",
-      projectId: "classroom-ops",
-      storageBucket: "classroom-ops.firebasestorage.app",
-      messagingSenderId: "824071287186",
-      appId: "1:824071287186:web:a3bdf1bf48442a398e114b",
-      measurementId: "G-SQCYD121PS"
+    apiKey:            "YOUR_API_KEY",
+    authDomain:        "YOUR_PROJECT.firebaseapp.com",
+    databaseURL:       "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+    projectId:         "YOUR_PROJECT",
+    storageBucket:     "YOUR_PROJECT.appspot.com",
+    messagingSenderId: "YOUR_SENDER_ID",
+    appId:             "YOUR_APP_ID"
   };
 
   // ================================================================
   //  [SEC-01] INSTRUCTOR PIN — change this string, push once.
   //  Rotate each cohort. One line. That's it.
   // ================================================================
-  const INSTRUCTOR_PIN = "CWP2026";
+  const INSTRUCTOR_PIN = "CWP2025";
 
   // ================================================================
   //  QUESTION BANK TEMPLATE — copy this into your .json files
@@ -779,16 +788,23 @@
 
   // ── DASHBOARD CONTROLS ────────────────────────────────────────
   document.getElementById("dash-launch-btn").addEventListener("click", async () => {
-    // Confirm a bank is loaded before launching
-    const snap = await get(rBank);
-    if (!snap.exists()) {
-      alert("No question bank loaded. Paste and apply a question bank first.");
+    try {
+      const snap = await get(rBank);
+      if (!snap.exists()) {
+        alert("No question bank loaded. Paste and apply a question bank first.");
+        return;
+      }
+      // Re-apply bank to UI in case header missed the update
+      applyBankToUI(snap.val());
+    } catch (e) {
+      alert("Could not verify question bank. Check your connection and try again.");
       return;
     }
     await set(rControl, { live: true, answersRevealed: false, launchedAt: Date.now() });
     const btn = document.getElementById("dash-launch-btn");
     safeText(btn, "SESSION ACTIVE ✓");
-    btn.style.cssText += ";border-color:var(--green-ok);color:var(--green-ok)";
+    btn.style.borderColor = "var(--green-ok)";
+    btn.style.color       = "var(--green-ok)";
   });
 
   document.getElementById("dash-reset-btn").addEventListener("click", async () => {
@@ -1162,7 +1178,10 @@ textarea { resize:vertical; min-height:110px; line-height:1.6; }
       <div class="field-wrap">
         <label class="field-label" for="pin-input">ACCESS CODE</label>
         <input type="password" id="pin-input" placeholder="••••••••"
-               autocomplete="off" aria-label="Instructor access code">
+               autocomplete="new-password"
+               data-lpignore="true"
+               data-1p-ignore="true"
+               aria-label="Instructor access code">
         <div class="err" id="pin-err" role="alert" aria-live="polite"></div>
       </div>
       <button class="btn btn-magenta btn-full" id="pin-submit" type="button">AUTHENTICATE →</button>
