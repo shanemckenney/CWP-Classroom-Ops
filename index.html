@@ -36,16 +36,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>CWP // CLASSROOM OPS</title>
 
-<!-- [SEC-03] Content Security Policy -->
-<meta http-equiv="Content-Security-Policy" content="
-  default-src 'none';
-  script-src 'self' 'unsafe-inline' https://www.gstatic.com;
-  style-src 'unsafe-inline';
-  connect-src https://*.firebaseio.com https://*.googleapis.com wss://*.firebaseio.com https://www.gstatic.com;
-  font-src 'none'; img-src 'none'; object-src 'none';
-  base-uri 'none'; form-action 'none';
-">
-
 <script type="module">
   import { initializeApp }
     from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
